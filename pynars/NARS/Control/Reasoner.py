@@ -1,16 +1,23 @@
 import random
 from os import remove
+from pynars.NAL.Functions.BudgetFunctions import Budget_forward, Budget_backward
+from pynars.NAL.Functions.StampFunctions import Stamp_merge
 from pynars.NAL.Functions.Tools import truth_to_quality
 from pynars.NARS.DataStructures._py.Channel import Channel
 
-from pynars.NARS.DataStructures._py.Link import TaskLink
+from pynars.NARS.DataStructures._py.Link import TaskLink, TermLink
 from pynars.NARS.InferenceEngine import TemporalEngine
 # from pynars.NARS.Operation import Interface_Awareness
 from pynars.Narsese._py.Budget import Budget
+from pynars.Narsese._py.Sentence import Judgement, Stamp, Tense, Question, Goal
 from pynars.Narsese._py.Statement import Statement
+from pynars.Narsese._py.Compound import Compound
+from pynars.Narsese._py.Connector import Connector
 from pynars.Narsese._py.Task import Belief
+from pynars.Narsese._py.Evidence import Base
+from pynars.Narsese import Copula, Item
 from ..DataStructures import Bag, Memory, NarseseChannel, Buffer, Task, Concept, EventBuffer
-from ..InferenceEngine import GeneralEngine, TemporalEngine, VariableEngine
+from ..InferenceEngine import GeneralEngine, TemporalEngine, VariableEngine, KanrenEngine
 from pynars import Config
 from pynars.Config import Enable
 from typing import Callable, List, Tuple, Union
@@ -19,10 +26,19 @@ from pynars import Global
 from time import time
 from pynars.NAL.Functions.Tools import project_truth, project
 from ..GlobalEval import GlobalEval
-
-
+from ..InferenceEngine.KanrenEngine import util
 
 class Reasoner:
+    avg_inference = 0
+    num_runs = 0
+    
+    all_theorems = Bag(100, 100, take_in_order=False)
+    theorems_per_cycle = 1
+
+    class TheoremItem(Item):
+        def __init__(self, theorem, budget: Budget) -> None:
+            super().__init__(hash(theorem), budget)
+            self._theorem = theorem
 
     def __init__(self, n_memory, capacity, config='./config.json', nal_rules={1, 2, 3, 4, 5, 6, 7, 8, 9}) -> None:
         # print('''Init...''')
@@ -30,7 +46,19 @@ class Reasoner:
 
         self.global_eval = GlobalEval()
 
-        self.inference = GeneralEngine(add_rules=nal_rules)
+        self.inference = KanrenEngine()
+        
+        # a = util.parse('(*,a,b,(*,c,d),e,(*,f,g)).')
+        # b = util.logic(a.term)
+
+        # c = util.term(b)
+
+        for theorem in self.inference.theorems:
+            priority = random.randint(0,9) * 0.01
+            item = self.TheoremItem(theorem, Budget(0.5 + priority, 0.8, 0.5))
+            self.all_theorems.put(item)
+
+        # self.inference = GeneralEngine(add_rules=nal_rules)
         self.variable_inference = VariableEngine(add_rules=nal_rules)
         self.temporal_inference = TemporalEngine(
             add_rules=nal_rules)  # for temporal causal reasoning
@@ -62,6 +90,17 @@ class Reasoner:
 
         self.sequence_buffer.reset()
         self.operations_buffer.reset()
+
+        # reset theorems priority
+        self.all_theorems.reset()
+        for theorem in self.inference.theorems:
+            priority = random.randint(0,9) * 0.01
+            item = self.TheoremItem(theorem, Budget(0.5 + priority, 0.8, 0.5))
+            self.all_theorems.put(item)
+
+        # reset metrics
+        self.avg_inference = 0
+        self.num_runs = 0
 
     def cycles(self, n_cycle: int):
         tasks_all_cycles = []
@@ -119,9 +158,14 @@ class Reasoner:
         #   general inference step
         concept: Concept = self.memory.take(remove=True)
         if concept is not None:
-            tasks_inference_derived = self.inference.step(concept)
+            # self.num_runs += 1
+            # t0 = time()
+            tasks_inference_derived = self.inference_step(concept)
             tasks_derived.extend(tasks_inference_derived)
-
+            # t1 = time() - t0 + 1e-6 # add epsilon to avoid division by 0
+            # self.avg_inference += (t1 - self.avg_inference) / self.num_runs
+            # print("inference:", 1 // self.avg_inference, "per second", f"({1//t1})")
+            
             is_concept_valid = True  # TODO
             if is_concept_valid:
                 self.memory.put_back(concept)
@@ -279,3 +323,423 @@ class Reasoner:
             Operation.register(op, callback)
             return op
         return None
+
+#################################################
+
+    # INFERENCE STEP 
+
+    def inference_step(self, concept: Concept):
+        '''One step inference.'''
+        tasks_derived = []
+
+        Global.States.record_concept(concept)
+        
+        # Based on the selected concept, take out a task and a belief for further inference.
+        task_link: TaskLink = concept.task_links.take(remove=True)
+        
+        if task_link is None: 
+            return tasks_derived
+        
+        concept.task_links.put_back(task_link)
+
+        task: Task = task_link.target
+
+        # print('')
+        # print(task.sentence)
+
+        # _t0 = time()
+        # t0 = time()
+
+        # inference for single-premise rules
+        if not task.immediate_rules_applied: # TODO: handle other cases
+            Global.States.record_premises(task)
+
+            results = []
+
+            backward = task.is_question or task.is_goal
+            res, cached = self.inference.inference_immediate(task.sentence, backward=backward)
+
+            if not cached:
+                results.extend(res)
+
+            for term, truth in results:
+                # TODO: how to properly handle stamp for immediate rules?
+                # base = Base((Global.get_input_id(),))
+                # stamp_task: Stamp = Stamp(Global.time, None, None, base)
+                stamp_task = task.stamp
+
+                if task.is_question and term[1] == 'cnv':
+                    question_derived = Question(term[0], stamp_task)
+                    task_derived = Task(question_derived)
+                    # set flag to prevent repeated processing
+                    task_derived.immediate_rules_applied = True
+                    task_derived.term._normalize_variables()
+                    tasks_derived.append(task_derived)
+                
+                if task.is_goal and term[1] == 'cnv':
+                    goal_derived = Goal(term[0], stamp_task, truth)
+                    task_derived = Task(goal_derived)
+                    # set flag to prevent repeated processing
+                    task_derived.immediate_rules_applied = True
+                    task_derived.term._normalize_variables()
+                    tasks_derived.append(task_derived)
+
+                if task.is_judgement: # TODO: hadle other cases
+                    # TODO: calculate budget
+                    budget = Budget_forward(truth, task_link.budget, None)
+                    budget.priority = budget.priority * 1/term[0].complexity
+                    sentence_derived = Judgement(term[0], stamp_task, truth)
+                    task_derived = Task(sentence_derived, budget)
+                    # set flag to prevent repeated processing
+                    task_derived.immediate_rules_applied = True
+                    # normalize the variable indices
+                    task_derived.term._normalize_variables()
+                    tasks_derived.append(task_derived)
+
+            # record immediate rule application for task
+            task.immediate_rules_applied = True
+
+        # _t1 = time() - t0 + 1e-6 # add epsilon to avoid division by 0
+        # print('single premise', 1//_t1)
+        # t0 = _t1
+        # self._run_count += 1
+
+
+        ### STRUCTURAL
+
+        if task.is_judgement or task.is_goal or task.is_question: #and not task.structural_rules_applied: # TODO: handle other cases
+            Global.States.record_premises(task)
+
+            results = []
+
+            # t0 = time()
+            theorems = []
+            for _ in range(min(self.theorems_per_cycle, len(self.all_theorems))):
+                theorem = self.all_theorems.take(remove=True)
+                theorems.append(theorem)
+            
+            for theorem in theorems:
+                # print(term(theorem._theorem))
+                # results.extend(self.inference_structural(task.sentence))
+                res, cached = self.inference.inference_structural(task.sentence, tuple([theorem._theorem]))
+                # print(res)
+                # print("")
+                if not cached:
+                    if res:
+                        new_priority = theorem.budget.priority + 0.1
+                        theorem.budget.priority = min(0.99, new_priority)
+                    else:
+                        new_priority = theorem.budget.priority - 0.1
+                        theorem.budget.priority = max(0.1, new_priority)
+
+                self.all_theorems.put(theorem)
+
+                results.extend(res)
+            # t1 = time() - t0
+            # self._structural_time_avg += (t1 - self._structural_time_avg) / self._run_count
+            # print("structural: ", 1 // self._structural_time_avg, "per second")
+            # for r in results:
+            #     print(r, r[0][0].complexity)
+            # print(task.budget.priority)
+            # print(task_link.budget.priority)
+            for term, truth in results:
+                # TODO: how to properly handle stamp for structural rules?
+                stamp_task: Stamp = task.stamp
+
+                if task.is_question:
+                    pass
+
+                if task.is_goal:
+                    goal_derived = Goal(term[0], stamp_task, truth)
+                    task_derived = Task(goal_derived)
+                    task_derived.term._normalize_variables()
+                    tasks_derived.append(task_derived)
+
+                if task.is_judgement: # TODO: hadle other cases
+                    # TODO: calculate budget
+                    budget = Budget_forward(truth, task_link.budget, None)
+                    budget.priority = budget.priority * 1/term[0].complexity
+                    sentence_derived = Judgement(term[0], stamp_task, truth)
+                    task_derived = Task(sentence_derived, budget)
+                    # task_derived.structural_rules_applied = True
+                    
+                    # normalize the variable indices
+                    task_derived.term._normalize_variables()
+                    tasks_derived.append(task_derived)
+
+            # record structural rule application for task
+            # task.structural_rules_applied = True
+
+        # _t1 = time() - t0 + 1e-6 # add epsilon to avoid division by 0
+        # print('structural', 1//_t1)
+        # t0 = _t1
+
+        # inference for two-premises rules
+        term_links = []
+        term_link_valid = None
+        is_valid = False
+        # n = len(concept.term_links)
+        # t0 = time()
+        # iter = 0
+        for _ in range(len(concept.term_links)): # TODO: should limit max number of links to process
+            # iter += 1
+            # To find a belief, which is valid to interact with the task, by iterating over the term-links.
+            # _t = time()
+            term_link: TermLink = concept.term_links.take(remove=True)
+            # print(round((time() - _t)*1000, 2))
+            term_links.append(term_link)
+
+            if not task_link.novel(term_link, Global.time):
+                continue
+            
+            concept_target: Concept = term_link.target
+            belief = concept_target.get_belief() # TODO: consider all beliefs.
+            
+            if belief is None: 
+                continue
+
+            if task == belief:
+                # if task.sentence.punct == belief.sentence.punct:
+                #     is_revision = revisible(task, belief)
+                continue
+            # TODO: currently causes infinite recursion with variables
+            # elif task.term.equal(belief.term): 
+            #     # TODO: here
+            #     continue
+            elif not belief.evidential_base.is_overlaped(task.evidential_base):
+                term_link_valid = term_link
+                is_valid = True
+                break
+
+        # t1 = time() - t0
+        # loop_time = round(t1 * 1000, 2)
+        # if loop_time > 20:
+        #     print("hello")
+        # print(iter, '/', n, "- loop time", loop_time, is_valid)
+        # print(is_valid, "Concept", concept.term)
+        if is_valid \
+            and task.is_judgement: # TODO: handle other cases
+            
+            Global.States.record_premises(task, belief)
+
+            # t0 = time()
+                    
+            results = []
+
+            # COMPOSITIONAL
+            if task.is_eternal and belief.is_eternal:
+                # events are handled in the event buffer
+                res, cached = self.inference.inference_compositional(task.sentence, belief.sentence)
+                
+                if not cached: 
+                    results.extend(res)
+            
+            # Temporal Projection and Eternalization
+            if belief is not None:
+                # TODO: Handle the backward inference.
+                if not belief.is_eternal and (belief.is_judgement or belief.is_goal):
+                    truth_belief = project_truth(task.sentence, belief.sentence)
+                    belief = belief.eternalize(truth_belief)
+                    # beleif_eternalized = belief # TODO: should it be added into the `tasks_derived`?
+
+            # SYLLOGISTIC
+            res, cached = self.inference.inference(task.sentence, belief.sentence, concept.term)
+
+            # t1 = time() - t0 + 1e-6 # add epsilon to avoid division by 0
+            # print('syllogistic', 1//t1)
+            # t0 = t1
+            # t1 = time() - t0
+
+            # print("inf:", 1 // t1, "per second")
+
+            # self._inference_time_avg += (t1 - self._inference_time_avg) / self._run_count
+
+            # print("avg:", 1 // self._inference_time_avg, "per second")
+            
+            # t0 = time()
+
+            
+            # t1 = time() - t0
+            # print("inf comp:", 1 // t1, "per second")
+            # t1 = time() - t0 + 1e-6 # add epsilon to avoid division by 0
+            # print('compositional', 1//t1)
+            # t0 = t1
+
+            if not cached:
+                results.extend(res)
+
+            # print(">>>", results)
+
+            for term, truth in results:
+
+                budget = Budget_forward(truth, task_link.budget, term_link_valid.budget)
+
+                # Add temporal dimension
+
+                conclusion = term[0]
+
+                t1 = task.sentence.term
+                t2 = belief.sentence.term
+
+                if type(conclusion) is Compound \
+                and conclusion.connector == Connector.Conjunction:
+                    # TODO: finish this
+                    if type(belief.term) is Compound or type(belief.term) is Statement:
+                        if belief.term.is_predictive:
+                            conclusion = conclusion.predictive()
+                        if belief.term.is_concurrent:
+                            conclusion = conclusion.concurrent()
+
+                if type(conclusion) is Statement \
+                and (conclusion.copula == Copula.Equivalence \
+                or conclusion.copula == Copula.Implication):
+
+                    if type(t1) is Statement \
+                    and type(t2) is Statement:
+                        
+                        if t1.copula.is_concurrent and t2.copula.is_concurrent:
+                            # both concurrent
+                            conclusion = conclusion.concurrent()
+
+                        if t1.copula.is_predictive and t2.copula.is_predictive:
+                            # both predictive
+                            conclusion = conclusion.predictive()
+
+                        if t1.copula.is_retrospective and t2.copula.is_retrospective:
+                            # both retrospective
+                            conclusion = conclusion.retrospective()
+
+                        if (t1.copula.is_concurrent and t2.copula.is_predictive) \
+                        or (t2.copula.is_concurrent and t1.copula.is_predictive):
+                            # one concurrent, one predictive
+                            conclusion = conclusion.predictive()
+                        
+                        if (t1.copula.is_concurrent and t2.copula.is_retrospective) \
+                        or (t2.copula.is_concurrent and t1.copula.is_retrospective):
+                            # one concurrent, one retrospective
+                            conclusion = conclusion.retrospective()
+
+                        terms = [] # more complex combinations require extra work
+
+                        if t1.copula.is_predictive and t2.copula.is_retrospective:
+                            terms = [t1.subject, t1.predicate]
+                            if t2.subject in terms:
+                                idx = terms.index(t2.subject)
+                                terms.insert(idx, t2.predicate)
+                            if t2.predicate in terms:
+                                idx = terms.index(t2.predicate)
+                                terms.insert(idx + 1, t2.subject)
+                        elif t2.copula.is_predictive and t1.copula.is_retrospective:
+                            terms = [t2.subject, t2.predicate]
+                            if t1.subject in terms:
+                                idx = terms.index(t1.subject)
+                                terms.insert(idx, t1.predicate)
+                            if t1.predicate in terms:
+                                idx = terms.index(t1.predicate)
+                                terms.insert(idx + 1, t1.subject)
+
+                        if conclusion.predicate in terms and conclusion.subject in terms:
+                            cpi = terms.index(conclusion.predicate)
+                            csi = terms.index(conclusion.subject)
+                            if cpi > csi:
+                                # predicate after subject
+                                conclusion = conclusion.predictive()
+                            else:
+                                # predicate before subject
+                                conclusion = conclusion.retrospective()
+
+
+                # calculate new stamp
+                stamp_task: Stamp = task.stamp
+                stamp_belief: Stamp = belief.stamp
+
+                # TODO: how to correctly determine order?
+                order_mark = None
+                whole = part = None
+
+                if task.sentence.term.copula and task.sentence.term.copula == Copula.PredictiveImplication:
+                    whole = task
+                    part = belief
+                if belief.sentence.term.copula and belief.sentence.term.copula == Copula.PredictiveImplication:
+                    whole = belief
+                    part = task
+
+                if part and whole:
+                    if part.term == whole.sentence.term.subject:
+                        order_mark = Copula.PredictiveImplication
+                    if part.term == whole.sentence.term.predicate:
+                        order_mark = Copula.RetrospectiveImplication
+
+                stamp = Stamp_merge(stamp_task, stamp_belief, order_mark)
+                
+                def add_task(term):
+                    sentence_derived = Judgement(term, stamp, truth)
+                    # print(stamp.tense == sentence_derived.stamp.tense)
+                    task_derived = Task(sentence_derived, budget)
+                    # print(task_derived.sentence.tense, task_derived)
+                    # normalize the variable indices
+                    task_derived.term._normalize_variables()
+                    tasks_derived.append(task_derived)
+
+                add_task(conclusion)
+
+                if type(conclusion) is Statement: # TODO: handle this better
+                    if conclusion.is_predictive or conclusion.is_retrospective:
+                        add_task(conclusion.temporal_swapped())
+
+            if term_link is not None:
+                for derived_task in tasks_derived: 
+                    reward: float = max(derived_task.budget.priority, task.achieving_level())
+                    term_link.reward_budget(reward)
+
+        # BACKWARD
+        if is_valid \
+            and task.is_question: # TODO: handle other cases
+
+            results = []
+
+            res, cached = self.inference.backward(task.sentence, belief.sentence)
+            # print('\nBackward:', res)
+            if not cached:
+                results.extend(res)
+
+            for term, _ in results:
+                # budget = Budget_backward(truth, task_link.budget, term_link_valid.budget)
+
+                question_derived = Question(term[0], task.stamp)
+                task_derived = Task(question_derived) #, budget)
+                tasks_derived.append(task_derived)
+
+        if is_valid \
+            and task.is_goal: # TODO: handle other cases
+
+            results = []
+
+            res, cached = self.inference.backward(task.sentence, belief.sentence)
+            # print('\nBackward:', res)
+            if not cached:
+                results.extend(res)
+
+            for term, truth in results:
+                # budget = Budget_backward(truth, task_link.budget, term_link_valid.budget)
+                conclusion = term[0]
+
+                if type(conclusion) is Compound \
+                and conclusion.connector == Connector.Conjunction:
+                    # TODO: finish this
+                    if type(belief.term) is Compound or type(belief.term) is Statement:
+                        if belief.term.is_predictive:
+                            conclusion = conclusion.predictive()
+                        if belief.term.is_concurrent:
+                            conclusion = conclusion.concurrent()
+
+                goal_derived = Goal(conclusion, task.stamp, truth)
+                task_derived = Task(goal_derived) #, budget)
+                tasks_derived.append(task_derived)
+
+
+        for term_link in term_links: 
+            concept.term_links.put_back(term_link)
+        
+        return list(filter(lambda t: t.is_question or t.truth.c > 0, tasks_derived))
+    
